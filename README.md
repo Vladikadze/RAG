@@ -1,97 +1,61 @@
-# RAG
 # Local RAG System
 
 **Retrieval-Augmented Generation over Private Documents**
 
-Python 3.11+ · ChromaDB · Ollama / LLaMA 3 · nomic-embed-text-v1
+---
+
+**Tech Stack:** Python 3.11+ · ChromaDB · Ollama / LLaMA 3 · nomic-embed-text-v1
 
 ---
 
-## Author
+## Overview
 
-Built as a personal project — fully local, zero cloud dependencies
+This project is a fully local Retrieval-Augmented Generation (RAG) system. It allows you to query private documents (CSV, JSON, TXT) using natural language and get grounded answers with source attribution.
 
----
+No data ever leaves your machine.
 
-## Purpose
+### How it works
 
-Query private business documents (CSV, JSON, TXT) using natural language.
+* **Retrieval:** Finds relevant document chunks using vector similarity
+* **Generation:** Feeds those chunks into an LLM to generate accurate answers
 
 ---
 
 ## Architecture
 
-Embed → Store (ChromaDB) → Retrieve → Generate (LLaMA 3 via Ollama)
+The system has two independent pipelines:
+
+### 1. Ingestion Pipeline (`ingest.py`)
+
+Processes and stores your data.
+
+| Stage          | What Happens                  | Key Detail                |
+| -------------- | ----------------------------- | ------------------------- |
+| File Discovery | Scans `data/` folder          | Supports CSV, JSON, TXT   |
+| Parsing        | Uses format-specific loaders  | pandas / custom / raw     |
+| Chunking       | Splits content into fragments | Overlap preserves context |
+| Metadata       | Adds structured tags          | source_file, type, etc.   |
+| Embedding      | Converts to vectors           | `nomic-embed-text-v1`     |
+| Storage        | Saves to ChromaDB             | Deduplicated via IDs      |
 
 ---
 
-## Status
+### 2. Query Pipeline (`query.py`)
 
-Working prototype — ingest and query pipelines complete
+Handles user questions.
 
----
-
-## Tech Stack
-
-* Python
-* sentence-transformers
-* ChromaDB
-* Ollama
-* pandas
-* torch
+| Stage    | What Happens                | Key Detail              |
+| -------- | --------------------------- | ----------------------- |
+| Encode   | Adds `search_query:` prefix | Matches embedding space |
+| Search   | Retrieves top-K chunks      | Optional filters        |
+| Dedup    | Removes similar chunks      | Avoids redundancy       |
+| Prompt   | Builds LLM input            | Context-only grounding  |
+| Generate | Runs LLaMA 3 (Ollama)       | Fully local             |
+| Output   | Returns answer + sources    | File paths included     |
 
 ---
 
-## 1. Project Overview
-
-This project is a fully local Retrieval-Augmented Generation (RAG) system. It allows users to ask natural language questions over private datasets (support tickets, CRM records, sales notes, policy files) and receive accurate, grounded answers.
-
-No data ever leaves the machine.
-
-### What is RAG?
-
-* **Retrieval**: Finds relevant document chunks using vector similarity
-* **Generation**: Uses an LLM to produce answers grounded in retrieved context
-
-This results in a system that behaves like a domain expert over your data.
-
----
-
-## 2. System Architecture
-
-The system consists of two independent pipelines sharing a ChromaDB vector store.
-
-### 2.1 Ingestion Pipeline (`ingest.py`)
-
-Processes raw data into embeddings.
-
-**Steps:**
-
-1. File discovery (`data/` folder)
-2. Format parsing (CSV, JSON, TXT)
-3. Chunking (overlapping segments)
-4. Metadata tagging
-5. Embedding (`nomic-embed-text-v1`)
-6. Storage in ChromaDB
-
----
-
-### 2.2 Query Pipeline (`query.py`)
-
-Handles user questions interactively.
-
-**Steps:**
-
-1. Encode query (`search_query:` prefix)
-2. Vector search (Top-K retrieval)
-3. Deduplication
-4. Prompt assembly
-5. LLM generation (LLaMA 3 via Ollama)
-6. Response with sources
-
----
-
-## 3. Repository Structure
+## Repository Structure
 
 ```
 project/
@@ -107,77 +71,92 @@ project/
 
 ---
 
-## 4. Chunking Strategy
+## Chunking Strategy
 
-### CSV Files
+### CSV
 
-Multiple chunk types are generated:
+| Type         | Purpose              |
+| ------------ | -------------------- |
+| schema       | File structure       |
+| preview      | Sample rows          |
+| column_stats | Aggregations         |
+| row          | Single record lookup |
+| row_group    | Multi-row analysis   |
 
-* `schema`
-* `preview`
-* `column_stats`
-* `row`
-* `row_group`
-
-This enables both granular lookup and aggregate reasoning.
-
----
-
-### JSON Files
-
-* Email threads → summary + messages + flattened structure
-* Generic JSON → summary + flattened chunks
+Key idea: **precompute aggregates** to avoid scanning entire tables.
 
 ---
 
-### TXT Files
+### JSON
 
-* Chunked with overlap (1200 chars, 200 overlap)
-* Split on paragraphs/sentences where possible
+* Email threads → summary + per-message chunks
+* Generic JSON → flattened key-value paths
 
 ---
 
-## 5. Embedding Model
+### TXT
+
+* ~1200 chars per chunk
+* 200-char overlap
+* Splits prefer paragraphs/sentences
+
+---
+
+## Embedding Model
 
 **Model:** `nomic-ai/nomic-embed-text-v1`
 
-Uses asymmetric prefixes:
+| Use Case  | Prefix             |
+| --------- | ------------------ |
+| Documents | `search_document:` |
+| Queries   | `search_query:`    |
 
-* Documents → `search_document:`
-* Queries → `search_query:`
-
-Runs fully on CPU for stability.
+Important: Missing prefixes = worse retrieval.
 
 ---
 
-## 6. Key Design Decisions
+## Key Design Decisions
 
 ### Stable Chunk IDs
 
-Deterministic IDs prevent duplicate ingestion.
+Prevents duplicate ingestion.
 
-### Retrieval Deduplication
-
-Removes near-identical chunks before LLM input.
-
-### Metadata Filtering
-
-Supports query prefixes:
-
-* `[ticket]`
-* `[lead]`
-* `[customer]`
-* `[sales_note]`
-
-### Fully Local
-
-* No APIs
-* No cloud
-* All models run locally
+```python
+def stable_chunk_id(filepath, chunk_index, text):
+    digest = hashlib.md5(text.encode()).hexdigest()[:10]
+    return f"{rel_path}::chunk::{chunk_index}::{digest}"
+```
 
 ---
 
-## 7. Installation & Setup
+### Deduplication
+
+Removes overlapping chunks before LLM step.
+
+---
+
+### Metadata Filtering
+
+Prefix queries to narrow scope:
+
+| Prefix       | Filter          |
+| ------------ | --------------- |
+| [ticket]     | support tickets |
+| [lead]       | CRM leads       |
+| [customer]   | customers       |
+| [sales_note] | sales notes     |
+
+---
+
+### Fully Local
+
+* ChromaDB → local storage
+* Embeddings → local model
+* LLM → Ollama (LLaMA 3)
+
+---
+
+## Installation
 
 ### 1. Install dependencies
 
@@ -199,72 +178,85 @@ ollama pull llama3
 mkdir -p data/tickets data/crm_records data/sales_notes
 ```
 
+---
+
 ### 4. Run ingestion
 
 ```bash
 python ingest.py
 ```
 
-### 5. Run query
+---
+
+### 5. Query
 
 ```bash
 python query.py
 ```
 
+Example:
+
+```
+[ticket] How many open tickets does Acme Corp have?
+```
+
 ---
 
-## 8. Configuration
+## Configuration
 
 ### ingest.py
 
-* `EMBED_BATCH_SIZE = 8`
-* `CHROMA_UPSERT_BATCH = 100`
-* `TXT_TARGET_CHARS = 1200`
-* `TXT_OVERLAP_CHARS = 200`
-* `CSV_ROW_GROUP_SIZE = 20`
-
-### query.py
-
-* `TOP_K = 10`
-* `LLM_MODEL = "llama3"`
+| Setting             | Default | Purpose          |
+| ------------------- | ------- | ---------------- |
+| EMBED_BATCH_SIZE    | 8       | Memory control   |
+| CHROMA_UPSERT_BATCH | 100     | Write batch size |
+| TXT_TARGET_CHARS    | 1200    | Chunk size       |
+| TXT_OVERLAP_CHARS   | 200     | Overlap          |
+| CSV_ROW_GROUP_SIZE  | 20      | Rows per chunk   |
 
 ---
 
-## 9. Limitations
+### query.py
 
-* Aggregation limits on very large datasets
+| Setting   | Default |
+| --------- | ------- |
+| TOP_K     | 10      |
+| LLM_MODEL | llama3  |
+
+---
+
+## Limitations
+
+* Large aggregations may be incomplete
 * No PDF support
-* No conversational memory
-* Limited by LLM capability
+* No conversation memory
+* Limited by local LLM quality
 * No re-ranking step
 
 ---
 
-## 10. Future Improvements
+## Future Improvements
 
 * PDF ingestion
-* Cross-encoder re-ranking
+* Re-ranking (cross-encoder)
 * Streaming responses
-* Web UI (Gradio / Streamlit)
-* Hybrid search (BM25 + vector)
+* Web UI (Gradio/Streamlit)
+* Hybrid search (BM25 + vectors)
 * Auto re-ingestion
 
 ---
 
-## 11. Glossary
+## Glossary
 
-* **RAG**: Retrieval-Augmented Generation
-* **Embedding**: Numeric representation of text
-* **ChromaDB**: Vector database
-* **Ollama**: Local LLM runtime
-* **Chunk**: Text fragment stored as vector
-
----
-
-## Summary
-
-A fully local, production-style RAG pipeline designed for privacy, flexibility, and extensibility — ideal for querying sensitive business data without relying on external APIs.
+| Term      | Meaning                |
+| --------- | ---------------------- |
+| RAG       | Retrieval + generation |
+| Embedding | Semantic vector        |
+| ChromaDB  | Vector database        |
+| Ollama    | Local LLM runtime      |
+| Chunk     | Document fragment      |
+| TOP_K     | Retrieved chunk count  |
 
 ---
 
-📄 Source document: fileciteturn0file0
+**Fully local. No cloud. Built for private data.**
