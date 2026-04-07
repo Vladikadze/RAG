@@ -1,0 +1,122 @@
+"""
+RAG Dataset Improvement Script for leads_cleaned.csv
+-----------------------------------------------------
+Issues fixed:
+  1. Drops zero-variance bool columns (has_valid_email, has_notes — all True)
+  2. Drops email_domain (100% derivable from email — pure redundancy)
+  3. Drops company_name_raw (superseded by company_name)
+  4. Drops lead_search_text (near-duplicate of lead_profile_text, missing quality score)
+  5. Drops lead_profile_text (rebuilt as a richer rag_chunk below)
+  6. Flags generic/recycled notes (8 unique notes shared across 50 leads — low signal)
+  7. Adds budget_rank (ordinal integer) so budget can be used as a filter range
+  8. Adds a budget_label (human-readable ordered label) for chunk readability
+  9. Rebuilds rag_chunk with richer context including quality signal and urgency framing
+ 10. Adds metadata JSON column for vector DB filtered retrieval
+"""
+
+import pandas as pd
+import json
+
+INPUT_PATH  = "leads_cleaned.csv"
+OUTPUT_PATH = "leads_rag_ready.csv"
+
+# ── 1. Load ────────────────────────────────────────────────────────────────────
+df = pd.read_csv(INPUT_PATH)
+print(f"Loaded {len(df)} rows, {df.shape[1]} columns")
+
+# ── 2. Drop redundant / zero-variance columns ──────────────────────────────────
+cols_to_drop = [
+    "has_valid_email",      # all True — zero variance
+    "has_notes",            # all True — zero variance
+    "email_domain",         # 100% derivable from email column
+    "company_name_raw",     # superseded by company_name (clean title-case)
+    "company_name_normalized",  # kept only in metadata for fuzzy matching
+    "lead_search_text",     # near-duplicate of lead_profile_text, missing quality score
+    "lead_profile_text",    # will be rebuilt as rag_chunk below
+]
+df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
+print(f"After dropping redundant columns: {df.shape[1]} columns remain")
+
+# ── 3. Flag recycled/generic notes (low RAG signal) ───────────────────────────
+# 8 note templates are shared across 50 leads — embeddings won't distinguish these.
+# Flag them so you can decide to enrich or down-weight them at index time.
+note_freq = df["notes"].value_counts()
+RECYCLED_THRESHOLD = 3  # a note shared by 3+ leads is a template, not unique insight
+recycled_notes = set(note_freq[note_freq >= RECYCLED_THRESHOLD].index)
+df["is_recycled_note"] = df["notes"].isin(recycled_notes)
+recycled_count = df["is_recycled_note"].sum()
+print(f"⚠️  {recycled_count} leads have generic/recycled notes (shared by 3+ leads). "
+      f"Consider enriching these before indexing.")
+
+# ── 4. Add ordinal budget rank (useful for numeric range filtering) ────────────
+BUDGET_ORDER = {
+    "Below 5K":  1,
+    "5K-10K":    2,
+    "10K-20K":   3,
+    "20K-50K":   4,
+    "50K+":      5,
+}
+df["budget_rank"] = df["budget_range"].map(BUDGET_ORDER)
+
+# ── 5. Add a clean budget label for chunk readability ─────────────────────────
+BUDGET_LABELS = {
+    "Below 5K":  "Budget: Below $5K (entry-level)",
+    "5K-10K":    "Budget: $5K–$10K (small)",
+    "10K-20K":   "Budget: $10K–$20K (mid)",
+    "20K-50K":   "Budget: $20K–$50K (mid-large)",
+    "50K+":      "Budget: $50K+ (enterprise)",
+}
+df["budget_label"] = df["budget_range"].map(BUDGET_LABELS)
+
+# ── 6. Build enriched RAG chunk ────────────────────────────────────────────────
+# Adds quality signal, urgency framing, and budget context that the original
+# lead_profile_text mostly had — but now with recycled-note flag and cleaner structure.
+
+def build_rag_chunk(row: pd.Series) -> str:
+    recycled_flag = " ⚠️ [generic note — may not be unique to this lead]" if row["is_recycled_note"] else ""
+    lines = [
+        f"Lead Profile | {row['lead_id']} | {row['company_name']}",
+        f"Contact: {row['contact_name']} | Email: {row['email']}",
+        f"Interest: {row['interest_area']} | {row['budget_label']} | Urgency: {row['urgency']}",
+        f"Lead Source: {row['lead_source']} | Status: {row['status']}",
+        f"Quality: {row['lead_quality_band']} (score {int(row['lead_quality_score'])})",
+        f"Notes: {row['notes']}{recycled_flag}",
+    ]
+    return "\n".join(lines)
+
+df["rag_chunk"] = df.apply(build_rag_chunk, axis=1)
+
+# ── 7. Build metadata JSON for filtered retrieval ─────────────────────────────
+def build_metadata(row: pd.Series) -> str:
+    meta = {
+        "lead_id":            row["lead_id"],
+        "company_name":       row["company_name"],
+        "contact_name":       row["contact_name"],
+        "interest_area":      row["interest_area"],
+        "budget_range":       row["budget_range"],
+        "budget_rank":        int(row["budget_rank"]),
+        "urgency":            row["urgency"],
+        "lead_source":        row["lead_source"],
+        "status":             row["status"],
+        "quality_band":       row["lead_quality_band"],
+        "quality_score":      int(row["lead_quality_score"]),
+        "is_recycled_note":   bool(row["is_recycled_note"]),
+    }
+    return json.dumps(meta)
+
+df["metadata"] = df.apply(build_metadata, axis=1)
+
+# ── 8. Reorder columns ─────────────────────────────────────────────────────────
+priority_cols = ["rag_chunk", "metadata"]
+other_cols = [c for c in df.columns if c not in priority_cols]
+df = df[priority_cols + other_cols]
+
+# ── 9. Save ────────────────────────────────────────────────────────────────────
+df.to_csv(OUTPUT_PATH, index=False)
+print(f"\n✓ Saved improved dataset → {OUTPUT_PATH}")
+print(f"  Rows: {len(df)}")
+print(f"  Columns: {list(df.columns)}")
+print(f"\n── Sample rag_chunk ──────────────────────────────────────")
+print(df["rag_chunk"].iloc[0])
+print(f"\n── Sample metadata ───────────────────────────────────────")
+print(df["metadata"].iloc[0])

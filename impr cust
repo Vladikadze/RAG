@@ -1,0 +1,124 @@
+"""
+RAG Dataset Improvement Script for customers_cleaned.csv
+---------------------------------------------------------
+Issues fixed:
+  1. Drops zero-variance bool columns (all True or all False — no signal)
+  2. Drops redundant company name columns (keeps one clean version)
+  3. Normalises inconsistent categoricals (country casing, lead_source casing)
+  4. Adds company_size_bucket for richer semantic context in chunks
+  5. Rebuilds rag_chunk with richer, structured text (replaces customer_search_text)
+  6. Adds metadata JSON column for vector store filtered retrieval
+  7. Formats phone as string (prevents numeric embedding artifacts)
+"""
+
+import pandas as pd
+import json
+
+INPUT_PATH  = "/Users/vladislavbogomazov/Desktop/Rag system mvp/data/customers_cleaned.csv"
+OUTPUT_PATH = "customers_rag_ready.csv"
+
+# ── 1. Load ────────────────────────────────────────────────────────────────────
+df = pd.read_csv(INPUT_PATH)
+print(f"Loaded {len(df)} rows, {df.shape[1]} columns")
+
+# ── 2. Drop zero-variance and redundant columns ────────────────────────────────
+cols_to_drop = [
+    "has_valid_email",       # all True
+    "has_valid_phone",       # all True
+    "is_active_customer",    # all False
+    "company_name_raw",      # superseded by company_name (clean title-case)
+    "company_name_normalized",  # kept only in metadata for fuzzy matching
+    "customer_search_text",  # will be rebuilt as rag_chunk below
+    "customer_age_days",     # derivable from created_at; adds clutter to chunk
+]
+df.drop(columns=[c for c in cols_to_drop if c in df.columns], inplace=True)
+print(f"After dropping redundant columns: {df.shape[1]} columns remain")
+
+# ── 3. Normalise inconsistent categoricals ─────────────────────────────────────
+# Country: "Uae" → "UAE", "Saudi Arabia" stays, etc.
+country_map = {
+    "Uae": "UAE", "uae": "UAE",
+    "Saudi Arabia": "Saudi Arabia",
+    "Qatar": "Qatar",
+    "Bahrain": "Bahrain",
+    "Kuwait": "Kuwait",
+    "Oman": "Oman",
+}
+df["country"] = df["country"].replace(country_map)
+
+# lead_source: unify casing
+df["lead_source"] = df["lead_source"].str.title()  # "cold outreach" → "Cold Outreach"
+
+# current_status: title-case
+df["current_status"] = df["current_status"].str.title()  # "qualified lead" → "Qualified Lead"
+
+# plan_interest: title-case for readability in chunks
+df["plan_interest"] = df["plan_interest"].str.title()
+
+# ── 4. Format phone as string (not a number for embedding) ────────────────────
+df["phone"] = df["phone"].astype(str)
+
+# ── 5. Add company_size_bucket ────────────────────────────────────────────────
+def size_bucket(n):
+    if pd.isna(n):      return "Unknown"
+    if n < 50:          return "Small (<50)"
+    if n < 200:         return "Mid-size (50–199)"
+    return               "Large (200+)"
+
+df["company_size_bucket"] = df["company_size"].apply(size_bucket)
+
+# ── 6. Parse created_at to a readable date string ─────────────────────────────
+df["created_at_str"] = pd.to_datetime(df["created_at"], utc=True).dt.strftime("%B %d, %Y")
+
+# ── 7. Build enriched RAG chunk ────────────────────────────────────────────────
+# Richer than the original customer_search_text: adds size bucket and
+# structures info into natural-language sentences for better embedding.
+
+def build_rag_chunk(row: pd.Series) -> str:
+    lines = [
+        f"Customer Profile | {row['customer_id']} | {row['company_name']}",
+        f"Industry: {row['industry']} | Country: {row['country']} | Company Size: {row['company_size_bucket']} ({int(row['company_size'])} employees)",
+        f"Contact: {row['contact_name']} | Email: {row['contact_email']} | Phone: {row['phone']}",
+        f"Sales Status: {row['current_status']} | Assigned Rep: {row['assigned_sales_rep']} | Lead Source: {row['lead_source']}",
+        f"Plan Interest: {row['plan_interest']}",
+        f"Customer Since: {row['created_at_str']}",
+    ]
+    return "\n".join(lines)
+
+df["rag_chunk"] = df.apply(build_rag_chunk, axis=1)
+
+# ── 8. Build metadata JSON for filtered retrieval ─────────────────────────────
+def build_metadata(row: pd.Series) -> str:
+    meta = {
+        "customer_id":    row["customer_id"],
+        "company_name":   row["company_name"],
+        "industry":       row["industry"],
+        "country":        row["country"],
+        "company_size":   int(row["company_size"]),
+        "size_bucket":    row["company_size_bucket"],
+        "status":         row["current_status"],
+        "sales_rep":      row["assigned_sales_rep"],
+        "lead_source":    row["lead_source"],
+        "plan_interest":  row["plan_interest"],
+        "created_at":     row["created_at_str"],
+    }
+    return json.dumps(meta)
+
+df["metadata"] = df.apply(build_metadata, axis=1)
+
+# ── 9. Drop temp columns & reorder ────────────────────────────────────────────
+df.drop(columns=["created_at_str"], inplace=True)
+
+priority_cols = ["rag_chunk", "metadata"]
+other_cols = [c for c in df.columns if c not in priority_cols]
+df = df[priority_cols + other_cols]
+
+# ── 10. Save ───────────────────────────────────────────────────────────────────
+df.to_csv(OUTPUT_PATH, index=False)
+print(f"\n✓ Saved improved dataset → {OUTPUT_PATH}")
+print(f"  Rows: {len(df)}")
+print(f"  Columns: {list(df.columns)}")
+print(f"\n── Sample rag_chunk ──────────────────────────────────────")
+print(df["rag_chunk"].iloc[0])
+print(f"\n── Sample metadata ───────────────────────────────────────")
+print(df["metadata"].iloc[0])
