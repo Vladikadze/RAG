@@ -209,7 +209,8 @@ data/tickets/ticket_456.csv
 - Aggregations limited by retrieved chunks  
 - No conversation memory  
 - Performance limited by local LLM  
-- No PDF ingestion  
+- No PDF ingestion
+- no inter rows comparison
 
 ---
 
