@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import math
 import hashlib
@@ -11,7 +12,7 @@ import pandas as pd
 from pandas.errors import ParserError
 from sentence_transformers import SentenceTransformer
 
-# ── Limit CPU threads BEFORE any heavy imports ──────────────────────────────
+# Limit CPU threads before heavy imports
 torch.set_num_threads(2)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -29,7 +30,7 @@ CHROMA_UPSERT_BATCH = 100
 TXT_TARGET_CHARS = 1200
 TXT_OVERLAP_CHARS = 200
 JSON_MAX_PATHS_PER_CHUNK = 80
-CSV_ROW_GROUP_SIZE = 20  # raised from 10 → more context per group chunk
+CSV_ROW_GROUP_SIZE = 20
 
 # Limits
 MAX_CELL_CHARS = 500
@@ -43,7 +44,7 @@ CSV_STATS_COLUMNS = [
 ]
 
 
-# ── Utility helpers ──────────────────────────────────────────────────────────
+# ---------------- Utility helpers ----------------
 
 def rel_source_path(filepath: str) -> str:
     return os.path.relpath(filepath, DATA_FOLDER)
@@ -83,6 +84,20 @@ def detect_type(path: str) -> str:
     return "document"
 
 
+def normalize_customer_id(value: Any) -> str:
+    """
+    Normalize customer IDs so 27, 027, cust_027, customer 027 all become 027.
+    If no digits exist, returns stripped string as-is.
+    """
+    text = safe_str(value)
+    if not text:
+        return ""
+    m = re.search(r"(\d+)", text)
+    if m:
+        return m.group(1).zfill(3)
+    return text.lower()
+
+
 def normalize_metadata(metadata: dict) -> dict:
     normalized = {}
     for key, value in metadata.items():
@@ -97,19 +112,19 @@ def normalize_metadata(metadata: dict) -> dict:
 
 def validate_chunk(chunk: dict, source_path: str) -> bool:
     if not isinstance(chunk, dict):
-        print(f"  ✗ Invalid chunk from {source_path}: chunk is not a dict")
+        print(f"  Invalid chunk from {source_path}: chunk is not a dict")
         return False
     if "text" not in chunk or "metadata" not in chunk:
-        print(f"  ✗ Invalid chunk from {source_path}: missing 'text' or 'metadata'")
+        print(f"  Invalid chunk from {source_path}: missing 'text' or 'metadata'")
         return False
     if not isinstance(chunk["text"], str):
-        print(f"  ✗ Invalid chunk from {source_path}: 'text' must be a string")
+        print(f"  Invalid chunk from {source_path}: 'text' must be a string")
         return False
     if not isinstance(chunk["metadata"], dict):
-        print(f"  ✗ Invalid chunk from {source_path}: 'metadata' must be a dict")
+        print(f"  Invalid chunk from {source_path}: 'metadata' must be a dict")
         return False
     if not chunk["text"].strip():
-        print(f"  ✗ Invalid chunk from {source_path}: empty text")
+        print(f"  Invalid chunk from {source_path}: empty text")
         return False
     return True
 
@@ -164,7 +179,22 @@ def batched(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
         yield items[i:i + batch_size]
 
 
-# ── JSON ingestion ───────────────────────────────────────────────────────────
+def ingest_jsonl(filepath: str):
+    print(f"\nLoading preprocessed chunks from {filepath}")
+    chunks = []
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            chunk = json.loads(line)
+            if not validate_chunk(chunk, filepath):
+                continue
+            chunks.append(chunk)
+
+    print(f"Loaded {len(chunks)} chunks from JSONL")
+    return chunks
+
+
+# ---------------- JSON ingestion ----------------
 
 def is_email_thread_like(obj: dict) -> bool:
     return isinstance(obj, dict) and isinstance(obj.get("messages"), list)
@@ -204,15 +234,20 @@ def load_json_email_thread(path: str, item: dict, item_index: int) -> list[dict]
     valid_messages = [m for m in messages if isinstance(m, dict)]
     valid_messages = sorted(valid_messages, key=lambda m: str(m.get("timestamp", "")))
 
+    customer_id = safe_str(item.get("customer_id"))
+    customer_id_norm = normalize_customer_id(customer_id)
+
     thread_metadata = {
         **make_base_metadata(path, "json", "email_thread"),
         "json_mode": "email_thread",
         "item_index": item_index,
         "thread_id": safe_str(item.get("thread_id")),
-        "customer_id": safe_str(item.get("customer_id")),
+        "customer_id": customer_id,
+        "customer_id_norm": customer_id_norm,
         "company_name": safe_str(item.get("company_name")),
         "subject": safe_str(item.get("subject")),
         "message_count": len(valid_messages),
+        "entity_scope": "single_customer" if customer_id_norm else "unknown",
     }
 
     thread_summary = {k: v for k, v in item.items() if k != "messages"}
@@ -232,6 +267,7 @@ def load_json_email_thread(path: str, item: dict, item_index: int) -> list[dict]
         f"File: {os.path.basename(path)}",
         "JSON object type: email_thread",
         f"Item index: {item_index}",
+        f"Customer ID: {customer_id_norm or customer_id}",
         "Thread summary:",
     ]
     for k, v in thread_summary.items():
@@ -248,6 +284,7 @@ def load_json_email_thread(path: str, item: dict, item_index: int) -> list[dict]
             f"JSON object type: email_thread\n"
             f"Item index: {item_index}\n"
             f"Message index: {i}\n"
+            f"Customer ID: {customer_id_norm or customer_id}\n"
             f"Thread ID: {safe_str(item.get('thread_id'))}\n"
             f"Subject: {safe_str(item.get('subject'))}\n"
             f"Company: {safe_str(item.get('company_name'))}\n"
@@ -273,11 +310,12 @@ def load_json_email_thread(path: str, item: dict, item_index: int) -> list[dict]
         f"File: {os.path.basename(path)}",
         "JSON object type: email_thread",
         f"Item index: {item_index}",
+        f"Customer ID: {customer_id_norm or customer_id}",
         "Flattened paths:",
     ] + [f"{k} = {v}" for k, v in flat_pairs]
 
-    header = "\n".join(path_lines[:4])
-    body_lines = path_lines[4:]
+    header = "\n".join(path_lines[:5])
+    body_lines = path_lines[5:]
 
     for chunk_i, start in enumerate(range(0, len(body_lines), JSON_MAX_PATHS_PER_CHUNK)):
         chunk_lines = [header] + body_lines[start:start + JSON_MAX_PATHS_PER_CHUNK]
@@ -301,6 +339,7 @@ def load_json_generic(path: str, item: Any, item_index: int) -> list[dict]:
         **make_base_metadata(path, "json", record_type),
         "json_mode": "generic",
         "item_index": item_index,
+        "entity_scope": "unknown",
     }
 
     flat_pairs = flatten_json(item)
@@ -357,7 +396,7 @@ def load_json(path: str) -> list[dict]:
     return documents
 
 
-# ── CSV ingestion ────────────────────────────────────────────────────────────
+# ---------------- CSV ingestion ----------------
 
 def infer_csv_record_type(path: str) -> tuple[str, str | None]:
     file_name = os.path.basename(path)
@@ -413,6 +452,11 @@ def load_csv(path: str) -> list[dict]:
     df.columns = [safe_str(c) for c in df.columns]
     columns = list(df.columns)
 
+    # Normalize customer_id if present
+    if "customer_id" in df.columns:
+        df["customer_id"] = df["customer_id"].apply(safe_str)
+        df["customer_id_norm"] = df["customer_id"].apply(normalize_customer_id)
+
     base_meta = {
         **make_base_metadata(path, "csv", record_type),
         "folder": folder_name,
@@ -420,30 +464,33 @@ def load_csv(path: str) -> list[dict]:
         "column_count": int(len(columns)),
     }
 
-    # ── Schema chunk ────────────────────────────────────────────────────────
+    # Schema chunk
     schema_lines = [
-        f"File: {file_name}", "Format: csv", f"Folder: {folder_name}",
-        f"Record type: {record_type}", f"Rows: {len(df)}", f"Columns: {len(columns)}",
-        "Column names:", *[f"- {col}" for col in columns],
+        f"File: {file_name}",
+        "Format: csv",
+        f"Folder: {folder_name}",
+        f"Record type: {record_type}",
+        f"Rows: {len(df)}",
+        f"Columns: {len(columns)}",
+        "Column names:",
+        *[f"- {col}" for col in columns],
     ]
     chunks.append({
         "text": "\n".join(schema_lines)[:MAX_TEXT_CHARS],
-        "metadata": {**base_meta, "chunk_type": "schema"},
+        "metadata": {**base_meta, "chunk_type": "schema", "entity_scope": "mixed"},
     })
 
-    # ── Preview chunk ────────────────────────────────────────────────────────
+    # Preview chunk
     preview_rows = df.head(min(5, len(df))).fillna("").to_dict(orient="records")
     preview_lines = [f"File: {file_name}", "Format: csv", "Preview rows:"]
     for i, row in enumerate(preview_rows):
-        preview_lines.append(f"Row {i}: {stringify_row(row, columns)}")
+        preview_lines.append(f"Row {i}: {stringify_row(row, columns + (['customer_id_norm'] if 'customer_id_norm' in df.columns else []))}")
     chunks.append({
         "text": "\n".join(preview_lines)[:MAX_TEXT_CHARS],
-        "metadata": {**base_meta, "chunk_type": "preview"},
+        "metadata": {**base_meta, "chunk_type": "preview", "entity_scope": "mixed"},
     })
 
-    # ── Per-column stats chunks ──────────────────────────────────────────────
-    # These give the LLM pre-computed counts so it can answer aggregate questions
-    # (e.g. "how many open tickets?") even when not all row data fits in TOP_K.
+    # Per-column stats chunks
     for col in CSV_STATS_COLUMNS:
         if col not in df.columns:
             continue
@@ -452,19 +499,21 @@ def load_csv(path: str) -> list[dict]:
         if not counts:
             continue
         lines = [
-            f"File: {file_name}", "Format: csv",
-            f"Record type: {record_type}", f"Total rows: {len(df)}",
+            f"File: {file_name}",
+            "Format: csv",
+            f"Record type: {record_type}",
+            f"Total rows: {len(df)}",
             f"Column value counts — {col}:",
         ] + [f"  {k}: {v}" for k, v in sorted(counts.items())]
         chunks.append({
             "text": "\n".join(lines)[:MAX_TEXT_CHARS],
-            "metadata": {**base_meta, "chunk_type": "column_stats", "stats_column": col},
+            "metadata": {**base_meta, "chunk_type": "column_stats", "stats_column": col, "entity_scope": "mixed"},
         })
 
-    # ── Row chunks (one per record, good for specific lookups) ───────────────
+    # Row chunks
     records = df.fillna("").to_dict(orient="records")
     for row_index, row in enumerate(records):
-        row_text = stringify_row(row, columns)
+        row_text = stringify_row(row, list(row.keys()))
         if not row_text:
             continue
 
@@ -477,16 +526,26 @@ def load_csv(path: str) -> list[dict]:
                     record_id = safe_str(row.get(fallback))
                     break
 
+        customer_id = safe_str(row.get("customer_id"))
+        customer_id_norm = normalize_customer_id(customer_id)
+
         chunk_text = (
-            f"File: {file_name}\nFormat: csv\nRecord type: {record_type}\n"
-            f"Row index: {row_index}\nColumns: {', '.join(columns)}\nRow data: {row_text}"
+            f"File: {file_name}\n"
+            f"Format: csv\n"
+            f"Record type: {record_type}\n"
+            f"Row index: {row_index}\n"
+            f"Customer ID: {customer_id_norm or customer_id}\n"
+            f"Columns: {', '.join(row.keys())}\n"
+            f"Row data: {row_text}"
         )
         metadata = {
             **base_meta,
             "chunk_type": "row",
             "row_index": row_index,
             "id": record_id,
+            "entity_scope": "single_customer" if customer_id_norm else "unknown",
         }
+
         for field in [
             "customer_id", "company_name", "status", "priority", "issue_type",
             "industry", "country", "assigned_to", "assigned_sales_rep", "sales_rep",
@@ -496,34 +555,79 @@ def load_csv(path: str) -> list[dict]:
             if value:
                 metadata[field] = value
 
+        if customer_id_norm:
+            metadata["customer_id_norm"] = customer_id_norm
+
         chunks.append({"text": chunk_text[:MAX_TEXT_CHARS], "metadata": metadata})
 
-    # ── Row-group chunks (broader context, good for analytical questions) ────
-    for group_start in range(0, len(records), CSV_ROW_GROUP_SIZE):
-        group = records[group_start:group_start + CSV_ROW_GROUP_SIZE]
-        group_lines = [
-            f"File: {file_name}", "Format: csv", f"Record type: {record_type}",
-            f"Row group: {group_start} to {group_start + len(group) - 1}",
-            f"Columns: {', '.join(columns)}",
-        ]
-        for i, row in enumerate(group, start=group_start):
-            row_text = stringify_row(row, columns)
-            if row_text:
-                group_lines.append(f"Row {i}: {row_text}")
-        chunks.append({
-            "text": "\n".join(group_lines)[:MAX_TEXT_CHARS],
-            "metadata": {
-                **base_meta,
-                "chunk_type": "row_group",
-                "row_group_start": group_start,
-                "row_group_end": group_start + len(group) - 1,
-            },
-        })
+    # Customer-safe row-group chunks:
+    # For datasets with customer_id, group WITHIN a single customer only.
+    if "customer_id_norm" in df.columns:
+        grouped = df.fillna("").groupby("customer_id_norm", dropna=False, sort=False)
+        for customer_id_norm, group_df in grouped:
+            if not safe_str(customer_id_norm):
+                continue
+
+            customer_records = group_df.to_dict(orient="records")
+            for group_start in range(0, len(customer_records), CSV_ROW_GROUP_SIZE):
+                group = customer_records[group_start:group_start + CSV_ROW_GROUP_SIZE]
+                row_indexes = [int(r.get("_row_index")) for r in group if "_row_index" in r]
+
+                group_lines = [
+                    f"File: {file_name}",
+                    "Format: csv",
+                    f"Record type: {record_type}",
+                    f"Customer ID: {customer_id_norm}",
+                    f"Grouped rows for one customer only",
+                    f"Columns: {', '.join(group[0].keys()) if group else ', '.join(columns)}",
+                ]
+                for row in group:
+                    row_idx = row.get("_row_index", "?")
+                    row_text = stringify_row(row, list(row.keys()))
+                    if row_text:
+                        group_lines.append(f"Row {row_idx}: {row_text}")
+
+                chunks.append({
+                    "text": "\n".join(group_lines)[:MAX_TEXT_CHARS],
+                    "metadata": {
+                        **base_meta,
+                        "chunk_type": "row_group",
+                        "customer_id_norm": customer_id_norm,
+                        "entity_scope": "single_customer",
+                        "row_group_start": row_indexes[0] if row_indexes else group_start,
+                        "row_group_end": row_indexes[-1] if row_indexes else group_start + len(group) - 1,
+                    },
+                })
+    else:
+        # Fallback for datasets without customer_id
+        for group_start in range(0, len(records), CSV_ROW_GROUP_SIZE):
+            group = records[group_start:group_start + CSV_ROW_GROUP_SIZE]
+            group_lines = [
+                f"File: {file_name}",
+                "Format: csv",
+                f"Record type: {record_type}",
+                f"Row group: {group_start} to {group_start + len(group) - 1}",
+                f"Columns: {', '.join(columns)}",
+            ]
+            for i, row in enumerate(group, start=group_start):
+                row_text = stringify_row(row, columns)
+                if row_text:
+                    group_lines.append(f"Row {i}: {row_text}")
+            chunks.append({
+                "text": "\n".join(group_lines)[:MAX_TEXT_CHARS],
+                "metadata": {
+                    **base_meta,
+                    "chunk_type": "row_group",
+                    "row_group_start": group_start,
+                    "row_group_end": group_start + len(group) - 1,
+                    "entity_scope": "mixed",
+                },
+            })
 
     return chunks
 
 
-# ── TXT ingestion ────────────────────────────────────────────────────────────
+# ---------------- TXT ingestion ----------------
 
 def load_txt(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -537,32 +641,43 @@ def load_txt(path: str) -> list[dict]:
     paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
     merged = "\n\n".join(paragraphs) if paragraphs else text.strip()
 
-    text_chunks = chunk_text_with_overlap(merged, target_chars=TXT_TARGET_CHARS, overlap_chars=TXT_OVERLAP_CHARS)
+    text_chunks = chunk_text_with_overlap(
+        merged,
+        target_chars=TXT_TARGET_CHARS,
+        overlap_chars=TXT_OVERLAP_CHARS,
+    )
 
     documents = []
     summary_lines = [
-        f"File: {file_name}", f"Path: {rel_path}", "Format: txt",
-        f"Record type: {file_type}", f"Character count: {len(text)}", f"Chunk count: {len(text_chunks)}",
+        f"File: {file_name}",
+        f"Path: {rel_path}",
+        "Format: txt",
+        f"Record type: {file_type}",
+        f"Character count: {len(text)}",
+        f"Chunk count: {len(text_chunks)}",
     ]
     documents.append({
         "text": "\n".join(summary_lines),
-        "metadata": {**base_meta, "chunk_type": "summary"},
+        "metadata": {**base_meta, "chunk_type": "summary", "entity_scope": "unknown"},
     })
 
     for i, chunk_text in enumerate(text_chunks):
         doc_text = (
-            f"File: {file_name}\nPath: {rel_path}\nFormat: txt\n"
-            f"Record type: {file_type}\nChunk index: {i}\n\n{chunk_text}"
+            f"File: {file_name}\n"
+            f"Path: {rel_path}\n"
+            f"Format: txt\n"
+            f"Record type: {file_type}\n"
+            f"Chunk index: {i}\n\n{chunk_text}"
         )
         documents.append({
             "text": doc_text[:MAX_TEXT_CHARS],
-            "metadata": {**base_meta, "chunk_type": "paragraph_window", "chunk_index": i},
+            "metadata": {**base_meta, "chunk_type": "paragraph_window", "chunk_index": i, "entity_scope": "unknown"},
         })
 
     return documents
 
 
-# ── File dispatch ────────────────────────────────────────────────────────────
+# ---------------- File dispatch ----------------
 
 def load_file(path: str) -> list[dict]:
     ext = os.path.splitext(path)[1].lower()
@@ -572,10 +687,9 @@ def load_file(path: str) -> list[dict]:
     return loaders[ext](path)
 
 
-# ── Embedding helpers ────────────────────────────────────────────────────────
+# ---------------- Embedding helpers ----------------
 
 def embed_texts(embedder: SentenceTransformer, texts: list[str]) -> list[list[float]]:
-    # Prefix required by nomic-embed-text-v1 for document embedding
     prefixed = [f"search_document: {t}" for t in texts]
 
     all_embeddings = []
@@ -597,7 +711,7 @@ def embed_texts(embedder: SentenceTransformer, texts: list[str]) -> list[list[fl
     return all_embeddings
 
 
-# ── Skip-already-ingested logic ──────────────────────────────────────────────
+# ---------------- Skip-already-ingested logic ----------------
 
 def get_existing_ids(collection) -> set[str]:
     result = collection.get(include=[])
@@ -619,7 +733,7 @@ def filter_new_chunks(
     return new_chunks, new_ids, new_metadata
 
 
-# ── Main ingestion ───────────────────────────────────────────────────────────
+# ---------------- Main ingestion ----------------
 
 def ingest_documents() -> None:
     if not os.path.exists(DATA_FOLDER):
@@ -633,25 +747,59 @@ def ingest_documents() -> None:
 
     found_files = False
 
+    jsonl_path = os.path.join(DATA_FOLDER, "rag_chunks.jsonl")
+
+    if os.path.exists(jsonl_path):
+        found_files = True
+        print(f"\nLoading preprocessed chunks from '{jsonl_path}'...")
+
+        try:
+            with open(jsonl_path, "r", encoding="utf-8") as f:
+                loaded_count = 0
+
+                for line in f:
+                    chunk = json.loads(line)
+
+                    if validate_chunk(chunk, jsonl_path):
+                        chunk["metadata"] = normalize_metadata(chunk["metadata"])
+
+                        # Backfill normalized customer ID if applicable
+                        if "customer_id" in chunk["metadata"] and "customer_id_norm" not in chunk["metadata"]:
+                            chunk["metadata"]["customer_id_norm"] = normalize_customer_id(chunk["metadata"]["customer_id"])
+
+                        all_chunks.append(chunk["text"])
+                        all_ids.append(chunk["id"])
+                        all_metadata.append(chunk["metadata"])
+                        loaded_count += 1
+
+                print(f"  Loaded {loaded_count} chunks from rag_chunks.jsonl")
+
+        except Exception as e:
+            print(f"  Failed loading rag_chunks.jsonl: {e}")
+
     print(f"\nScanning '{DATA_FOLDER}/'...")
     for root, _, files in os.walk(DATA_FOLDER):
         for filename in files:
-            found_files = True
             filepath = os.path.join(root, filename)
+
+            if filepath == jsonl_path:
+                continue
+
+            found_files = True
 
             try:
                 chunks = load_file(filepath)
             except ValueError as e:
-                print(f"  ✗ Skipped {rel_source_path(filepath)}: {e}")
+                print(f"  Skipped {rel_source_path(filepath)}: {e}")
                 continue
             except ParserError as e:
-                print(f"  ✗ Failed {rel_source_path(filepath)}: parser error: {e}")
+                print(f"  Failed {rel_source_path(filepath)}: parser error: {e}")
                 continue
             except json.JSONDecodeError as e:
-                print(f"  ✗ Failed {rel_source_path(filepath)}: invalid JSON: {e}")
+                print(f"  Failed {rel_source_path(filepath)}: invalid JSON: {e}")
                 continue
             except Exception as e:
-                print(f"  ✗ Failed {rel_source_path(filepath)}: {e}")
+                print(f"  Failed {rel_source_path(filepath)}: {e}")
                 continue
 
             valid_chunks = []
@@ -661,11 +809,11 @@ def ingest_documents() -> None:
                     valid_chunks.append(chunk)
 
             if not valid_chunks:
-                print(f"  - {rel_source_path(filepath)}: no valid chunks produced")
+                print(f"  {rel_source_path(filepath)}: no valid chunks produced")
                 continue
 
             chunk_type = valid_chunks[0]["metadata"].get("record_type", "unknown")
-            print(f"  ✓ {rel_source_path(filepath)}: {len(valid_chunks)} chunks (type: {chunk_type})")
+            print(f"  {rel_source_path(filepath)}: {len(valid_chunks)} chunks (type: {chunk_type})")
 
             for i, chunk in enumerate(valid_chunks):
                 all_chunks.append(chunk["text"])
@@ -692,12 +840,12 @@ def ingest_documents() -> None:
     )
 
     if not all_chunks:
-        print("✓ Nothing new to ingest — all chunks already in Chroma.")
+        print("Nothing new to ingest — all chunks already in Chroma.")
         return
 
     print(f"New chunks to embed and store: {len(all_chunks)}")
 
-    print("\nLoading embedding model (this may take ~30s the first time)...")
+    print("\nLoading embedding model...")
     embedder = SentenceTransformer(
         EMBED_MODEL_NAME,
         trust_remote_code=True,
@@ -718,8 +866,8 @@ def ingest_documents() -> None:
         print(f"  [{done}/{len(all_chunks)}] upserted", end="\r")
 
     print()
-    print(f"\n✓ Done! {len(all_chunks)} new chunks stored in Chroma collection '{COLLECTION_NAME}'.")
-    print(f"  Total in collection: {len(existing_ids) + len(all_chunks)}")
+    print(f"\nDone! {len(all_chunks)} new chunks stored in Chroma collection '{COLLECTION_NAME}'.")
+    print(f"Total in collection: {len(existing_ids) + len(all_chunks)}")
 
 
 if __name__ == "__main__":
