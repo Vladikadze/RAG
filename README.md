@@ -1,279 +1,225 @@
-# Local RAG System
+# Local RAG System  
+**Retrieval-Augmented Generation over Structured Business Data**
 
-**Retrieval-Augmented Generation over Structured Private Data**
-
-**Tech Stack:** Python 3.11+ · ChromaDB · Ollama (LLaMA 3) · nomic-embed-text-v1
+**Tech Stack:** Python 3.11 · ChromaDB · Ollama (LLaMA 3) · SentenceTransformers · nomic-embed-text-v1  
 
 ---
 
 ## Overview
 
-This project implements a fully local Retrieval-Augmented Generation (RAG) system designed for querying structured business data (CRM records, support tickets, sales notes, emails).
+This project implements a fully local Retrieval-Augmented Generation (RAG) system designed for querying structured business data such as CRM records, support tickets, sales notes, and email threads.
 
-The focus is not just on retrieval, but on **data preparation, chunk design, and filtering**, which are the primary failure points in naive RAG systems.
+The system is built around a core principle:
 
-In practice, RAG quality is dominated by data quality—not model choice.
-This system is built to address:
+> **RAG quality is determined far more by data design and retrieval strategy than by model choice.**
 
-* noisy and inconsistent raw data
-* duplicated semantic content
-* lack of structured filtering
-* unstable retrieval results
+Instead of treating RAG as a simple “embed + search” problem, this system focuses on:
+
+- structured data transformation  
+- metadata-aware retrieval  
+- entity-safe querying  
+- deterministic filtering and ranking  
 
 ---
 
 ## System Architecture
 
-Two independent pipelines:
+The system is split into two independent pipelines:
 
 ### 1. Ingestion Pipeline (`ingest.py`)
-
-Processes raw data into embeddings stored in ChromaDB.
+Transforms raw data into structured, high-signal chunks and stores embeddings in ChromaDB.
 
 ### 2. Query Pipeline (`query.py`)
-
-Handles user queries and generates grounded responses using retrieved context.
+Handles user queries, retrieves relevant context, and generates grounded answers using LLaMA 3 via Ollama.
 
 ---
 
-### Query Flow
-
-```
+## End-to-End Query Flow
 User Query
-   ↓
-Encode (search_query:)
-   ↓
+↓
+Query Parsing (entity + type extraction)
+↓
+Embedding (search_query prefix)
+↓
 Vector Search (ChromaDB)
-   ↓
-Metadata Filtering
-   ↓
-Deduplication
-   ↓
-Prompt Construction
-   ↓
+↓
+Metadata Filtering (type + customer scope)
+↓
+Deduplication + Re-ranking
+↓
+Context Construction
+↓
 LLM (LLaMA 3 via Ollama)
-   ↓
+↓
 Answer + Sources
-```
 
 ---
 
 ## Key Design Decisions
 
-### 1. Two-stage data pipeline
+### 1. Entity-Aware Retrieval (Customer Isolation)
 
-**Design:**
+Queries automatically detect and normalize customer IDs (e.g. `customer 27 → 027`) and enforce strict scoping:
 
-* Stage 1 → data cleaning & normalization
-* Stage 2 → RAG-specific transformation
+- Filters applied at query time (`customer_id_norm`)
+- Only “single_customer” chunks are allowed  
+- Guardrails prevent cross-customer data mixing  
 
-**Why:**
-
-* Keeps clean data reusable for analytics
-* Allows iteration on retrieval without reprocessing raw data
-
-**Tradeoff:**
-
-* Increased pipeline complexity
+**Why it matters:**  
+Prevents one of the most common RAG failures: mixing data across entities.
 
 ---
 
-### 2. Structured chunks over free text
+### 2. Metadata Filtering Before Similarity Search
 
-Chunks are formatted as labeled key-value pairs.
+Structured filters (record type, customer, etc.) are applied directly during vector search.
 
-**Why:**
+**Why it matters:**
 
-* Improves embedding consistency
-* Makes outputs interpretable when surfaced
-
-**Tradeoff:**
-
-* Less natural language → potentially weaker generative fluency
+- Reduces search space  
+- Improves precision vs pure vector similarity  
+- Makes retrieval deterministic and debuggable  
 
 ---
 
-### 3. Metadata filtering before retrieval
+### 3. Structured Chunking (Not Free Text)
 
-Queries can include filters (e.g. `[ticket]`, priority, sales rep).
+All data is transformed into structured, labeled chunks:
 
-**Why:**
+- **CSV:** schema, preview, row, row_group, column_stats  
+- **JSON:** thread summaries, individual messages, flattened paths  
+- **TXT:** paragraph windows with overlap  
 
-* Reduces search space
-* Improves precision vs pure vector similarity
+Example chunk types:
 
-**Tradeoff:**
+- `row` → atomic records  
+- `row_group` → precomputed aggregations  
+- `thread_summary` → email-level context  
+- `individual_message` → fine-grained detail  
 
-* Requires structured metadata upfront
+**Why it matters:**
 
----
-
-### 4. Duplicate content handling via flags
-
-Repeated content is **flagged, not removed**.
-
-**Why:**
-
-* Prevents vector collapse (identical embeddings dominating results)
-* Preserves full dataset for auditability
-
-**Tradeoff:**
-
-* Requires careful filtering to avoid noisy retrieval
+- Improves embedding consistency  
+- Enables reasoning over structured data  
+- Makes outputs interpretable and auditable  
 
 ---
 
-### 5. Dataset-specific chunk strategies
+### 4. Customer-Safe Aggregations
 
-Example (support tickets):
+Instead of scanning full datasets at query time:
 
-* `rag_chunk_full` → includes resolution
-* `rag_chunk_issue` → excludes resolution
+- Rows are grouped per customer during ingestion  
+- Aggregations are stored as `row_group` chunks  
+- Groups never mix customers  
 
-**Why:**
+**Why it matters:**
 
-* Prevents resolution text from biasing similarity search
-
-**Tradeoff:**
-
-* Increased storage and ingestion complexity
-
----
-
-### 6. Ordinal feature encoding
-
-Fields like priority and budget are mapped to numeric ranks.
-
-**Why:**
-
-* Enables range-based filtering in vector DB
-
-**Tradeoff:**
-
-* Requires additional preprocessing logic
+- Enables scalable aggregation queries  
+- Prevents incomplete answers  
+- Keeps latency low  
 
 ---
 
-## Data Pipeline
+### 5. Deduplication + Heuristic Re-ranking
 
-### Stage 1 — Cleaning (`data_cleaning.py`)
+Retrieved chunks are:
 
-Goal: **correctness and consistency**
+- deduplicated using content fingerprints  
+- re-ranked using metadata-aware scoring  
 
-* column normalization (naming, casing, formatting)
-* null handling and whitespace cleanup
-* email / phone validation
-* categorical standardization (status, source, priority)
-* deduplication (row-level + ID-level)
-* derived features (risk scores, flags, metrics)
+Scoring priorities:
 
-Output: clean, structured datasets usable beyond RAG
+- +100 → exact customer match  
+- +20 → row-level data  
+- +15 → messages  
+- +10 → grouped data  
 
----
+**Why it matters:**
 
-### Stage 2 — RAG Transformation
-
-Goal: **retrieval quality**
-
-* rebuild text into structured `rag_chunk`
-* attach metadata for filtering
-* remove zero-signal columns
-* flag low-quality or recycled content
-* enrich data (topics, buckets, derived categories)
-
-Output:
-
-* `rag_chunk` → embedded
-* `metadata` → stored for filtering
+- Reduces noise  
+- Prioritizes high-signal context  
+- Stabilizes outputs  
 
 ---
 
-## Chunking Strategy
+### 6. Embedding Strategy
 
-### CSV
+- Model: `nomic-embed-text-v1`  
+- Prefixing strategy:
+  - Documents → `search_document:`  
+  - Queries → `search_query:`  
 
-* schema chunks (structure awareness)
-* preview chunks (sample rows)
-* row chunks (record lookup)
-* row_group chunks (aggregations)
-
-**Key idea:** precompute aggregates instead of scanning entire tables
-
----
-
-### JSON
-
-* email threads → summary + per-message chunks
-* generic JSON → flattened key-value paths
+**Why it matters:**  
+Aligns query and document embeddings in the same semantic space.
 
 ---
 
-### TXT
+### 7. Robust Multi-Format Ingestion
 
-* ~1200 characters per chunk
-* 200-character overlap
-* paragraph-aware splitting
+Supports:
 
----
+- **CSV**
+  - schema + preview + row + grouped + stats chunks  
+- **JSON**
+  - email threads (structured + temporal)  
+  - generic JSON (flattened paths)  
+- **TXT**
+  - paragraph-aware chunking with overlap  
 
-## Embedding Strategy
+Includes:
 
-**Model:** `nomic-ai/nomic-embed-text-v1`
-
-| Use Case  | Prefix             |
-| --------- | ------------------ |
-| Documents | `search_document:` |
-| Queries   | `search_query:`    |
-
-**Reasoning:**
-Aligns query and document embeddings in the same vector space.
+- safe parsing (multiple CSV strategies)  
+- normalization (IDs, whitespace, metadata)  
+- validation and chunk integrity checks  
 
 ---
 
-## Retrieval Pipeline
+## Prompting Strategy
 
-* top-K similarity search
-* optional metadata filtering
-* deduplication of overlapping chunks
-* context-only prompt construction
+The LLM is constrained to:
+
+- answer **only using retrieved context**  
+- explicitly state when data is missing  
+- avoid guessing or hallucination  
+- enforce strict entity boundaries  
 
 ---
 
 ## Example
 
-```
-[ticket] How many open tickets does Acme Corp have?
-```
+**Query**
+[ticket] How many open tickets does customer 027 have?
 
-**Output:**
-
-```
-Acme Corp has 12 open tickets.
+**Output**
+Customer 027 has 12 open tickets.
 
 Sources:
-- data/tickets/ticket_123.csv
-- data/tickets/ticket_456.csv
-```
+
+data/tickets/ticket_123.csv
+data/tickets/ticket_456.csv
+
 
 ---
 
 ## Limitations
 
-* Retrieval degrades for vague or underspecified queries
-* Large aggregations may be incomplete (chunk-based retrieval)
-* No hybrid search (BM25 + vectors)
-* No conversation memory
-* Limited by local LLM performance
-* No PDF ingestion
+- No hybrid search (BM25 + vector)  
+- No cross-encoder re-ranking  
+- Aggregations limited by retrieved chunks  
+- No conversation memory  
+- Performance limited by local LLM  
+- No PDF ingestion  
 
 ---
 
 ## Future Improvements
 
-* hybrid search (BM25 + vector)
-* re-ranking (cross-encoder)
-* PDF ingestion
-* streaming responses
-* automated re-ingestion
+- Hybrid retrieval (BM25 + vector)  
+- Cross-encoder re-ranking  
+- Query decomposition for complex queries  
+- Streaming responses  
+- Automated re-ingestion pipelines  
+- PDF and unstructured document support  
 
 
