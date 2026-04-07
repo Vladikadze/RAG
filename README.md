@@ -403,7 +403,8 @@ Example:
 * No PDF support
 * No conversation memory
 * Limited by local LLM quality
-* No re-ranking step
+* not using metadata beyond record_type
+* no hybrid scoring
 
 ---
 
