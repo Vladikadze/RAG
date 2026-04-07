@@ -413,7 +413,6 @@ Example:
 * PDF ingestion
 * Re-ranking (cross-encoder)
 * Streaming responses
-* Web UI (Gradio/Streamlit)
 * Hybrid search (BM25 + vectors)
 * Auto re-ingestion
 
@@ -430,6 +429,3 @@ Example:
 | Chunk     | Document fragment      |
 | TOP_K     | Retrieved chunk count  |
 
----
-
-**Fully local. No cloud. Built for private data.**
