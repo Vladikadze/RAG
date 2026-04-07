@@ -189,15 +189,12 @@ The LLM is constrained to:
 ## Example
 
 **Query**
-[ticket] How many open tickets does customer 027 have?
+what is the name of cust 025
 
 **Output**
-Customer 027 has 12 open tickets.
+According to the provided data files (CRM records, support tickets, and sales notes), the customer with ID 025 is Northstar Security.
 
-Sources:
-
-data/tickets/ticket_123.csv
-data/tickets/ticket_456.csv
+📄 Sources: customers_rag_ready.csv, sales_notes_rag_ready.csv, support_tickets_rag_ready.csv
 
 
 ---
